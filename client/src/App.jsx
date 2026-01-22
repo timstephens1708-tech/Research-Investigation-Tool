@@ -288,6 +288,38 @@ function App() {
     setContextMenu({ x: e.pageX, y: e.pageY, roundId });
   };
 
+  const handleExportProject = async () => {
+    clearMessages();
+    setLoading(true);
+    setSuccessMsg('Rapport wordt gegenereerd, een moment geduld...');
+
+    try {
+      const res = await fetch(`${API_BASE}/projects/${selectedProject.id}/export`, {
+        method: 'POST'
+      });
+
+      if (res.ok) {
+        const blob = await res.blob();
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `${selectedProject.title.replace(/[^a-z0-9]/gi, '_')}_verslag.pdf`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setSuccessMsg('Rapport succesvol gegenereerd en gedownload.');
+      } else {
+        const err = await res.json();
+        setErrorMsg(err.error || 'Export mislukt.');
+      }
+    } catch (err) {
+      console.error(err);
+      setErrorMsg('Netwerkfout bij het genereren van het rapport.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const selectProject = (p) => {
     setSelectedProject(p);
     setActiveSourceId(null);
@@ -321,10 +353,20 @@ function App() {
           </div>
         )}
 
-        <header style={{ marginBottom: '4rem' }}>
-          <span className="glass" style={{ fontSize: '0.7rem', color: 'var(--accent-primary)', textTransform: 'uppercase', padding: '0.2rem 0.6rem' }}>Onderzoek</span>
-          <h1 style={{ fontSize: '2.5rem', marginTop: '0.5rem' }}>{selectedProject.title}</h1>
-          <p style={{ marginTop: '1rem', opacity: 0.8, borderLeft: '4px solid var(--accent-secondary)', paddingLeft: '1rem' }}>{selectedProject.research_question}</p>
+        <header style={{ marginBottom: '4rem', display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+          <div style={{ flex: 1 }}>
+            <span className="glass" style={{ fontSize: '0.7rem', color: 'var(--accent-primary)', textTransform: 'uppercase', padding: '0.2rem 0.6rem' }}>Onderzoek</span>
+            <h1 style={{ fontSize: '2.5rem', marginTop: '0.5rem' }}>{selectedProject.title}</h1>
+            <p style={{ marginTop: '1rem', opacity: 0.8, borderLeft: '4px solid var(--accent-secondary)', paddingLeft: '1rem' }}>{selectedProject.research_question}</p>
+          </div>
+          <button
+            className="btn btn-primary"
+            onClick={handleExportProject}
+            disabled={loading}
+            style={{ background: 'linear-gradient(135deg, #10b981 0%, #059669 100%)', whiteSpace: 'nowrap' }}
+          >
+            {loading ? 'Genereren...' : '📄 Rapport Genereren (PDF)'}
+          </button>
         </header>
 
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 400px', gap: '3rem', alignItems: 'flex-start' }}>
