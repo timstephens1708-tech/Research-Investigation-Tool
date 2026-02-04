@@ -115,7 +115,14 @@ app.delete('/api/rounds/:roundId', async (req, res) => {
         .delete({ count: 'exact' })
         .eq('id', req.params.roundId);
 
-    if (error) return res.status(500).json({ error: error.message });
+    if (error) {
+        if (error.code === '23503') {
+            return res.status(409).json({
+                error: 'Cannot delete because dependent data exists. Archive instead.'
+            });
+        }
+        return res.status(500).json({ error: error.message });
+    }
     if (count === 0) return res.status(404).json({ error: 'Round not found.' });
     res.json({ message: 'Round and associated data deleted.' });
 });
@@ -164,6 +171,9 @@ app.post('/api/projects/:projectId/sources', async (req, res) => {
     if (!source_type) return res.status(400).json({ error: 'Source type is required.' });
     if (!roundId) return res.status(400).json({ error: 'roundId is required for creation.' });
 
+    const trimmedSummary = summary?.trim();
+    if (!trimmedSummary) return res.status(400).json({ error: 'Summary is required.' });
+
     // Validate URL format
     try { new URL(url.trim()); } catch (e) { return res.status(400).json({ error: 'Invalid URL format.' }); }
 
@@ -198,7 +208,7 @@ app.post('/api/projects/:projectId/sources', async (req, res) => {
                 author,
                 publisher,
                 published_at: published_at || null, // Fix: Empty string causes DB error
-                summary,
+                summary: trimmedSummary,
                 notes
             }])
             .select();
@@ -334,7 +344,7 @@ app.post('/api/sources/:sourceId/extracts', async (req, res) => {
     }
 
     const { data, error } = await supabase
-        .from('extracts')
+        .from('quotes')
         .insert([{
             source_id: sourceId,
             extract_type,
@@ -351,7 +361,7 @@ app.post('/api/sources/:sourceId/extracts', async (req, res) => {
 // List Extracts for Source
 app.get('/api/sources/:sourceId/extracts', async (req, res) => {
     const { data, error } = await supabase
-        .from('extracts')
+        .from('quotes')
         .select('*')
         .eq('source_id', req.params.sourceId)
         .order('created_at', { ascending: true });
@@ -363,11 +373,18 @@ app.get('/api/sources/:sourceId/extracts', async (req, res) => {
 // Delete Extract
 app.delete('/api/extracts/:extractId', async (req, res) => {
     const { error, count } = await supabase
-        .from('extracts')
+        .from('quotes')
         .delete({ count: 'exact' })
         .eq('id', req.params.extractId);
 
-    if (error) return res.status(500).json({ error: error.message });
+    if (error) {
+        if (error.code === '23503') {
+            return res.status(409).json({
+                error: 'Cannot delete because dependent data exists. Archive instead.'
+            });
+        }
+        return res.status(500).json({ error: error.message });
+    }
     if (count === 0) return res.status(404).json({ error: 'Extract not found.' });
     res.json({ message: 'Extract deleted.' });
 });
@@ -406,7 +423,7 @@ app.post('/api/sources/:sourceId/evidence', async (req, res) => {
     // If extract_id is provided, verify it belongs to the same source
     if (extract_id) {
         const { data: extract, error: extErr } = await supabase
-            .from('extracts')
+            .from('quotes')
             .select('source_id')
             .eq('id', extract_id)
             .single();
@@ -430,7 +447,16 @@ app.post('/api/sources/:sourceId/evidence', async (req, res) => {
         }])
         .select();
 
-    if (error) return res.status(500).json({ error: error.message });
+    if (error) {
+        console.error('Evidence Insert Error:', error);
+        if (error.code === '23503') {
+            return res.status(400).json({
+                error: 'Ongeldige koppeling',
+                details: 'source_id moet bestaan en extract_id (indien gezet) moet bij dezelfde bron horen.'
+            });
+        }
+        return res.status(500).json({ error: error.message });
+    }
     res.status(201).json({ id: data[0].id, message: 'Bewijsstuk succesvol vastgelegd.' });
 });
 
@@ -482,24 +508,117 @@ app.post('/api/projects/:projectId/export', async (req, res) => {
         if (pErr || !project) return res.status(404).json({ error: 'Project niet gevonden.' });
 
         // 2. Aggregate Data (Deterministic Ordering)
-        // Rounds
-        const { data: rounds } = await supabase.from('search_rounds').select('*').eq('project_id', projectId).order('created_at', { ascending: true });
+        // Phase 1: Fetch rounds + queries
+        const { data: roundsRaw, error: rErr } = await supabase
+            .from('search_rounds')
+            .select('*')
+            .eq('project_id', projectId)
+            .order('created_at', { ascending: true });
 
-        // Queries (per Round)
-        const roundsWithQueries = await Promise.all((rounds || []).map(async (r) => {
-            const { data: queries } = await supabase.from('search_queries').select('*').eq('round_id', r.id).order('executed_at', { ascending: true }).order('created_at', { ascending: true });
-            return { ...r, queries: queries || [] };
-        }));
+        if (rErr) return res.status(500).json({ error: rErr.message });
 
-        // Sources
-        const { data: sources } = await supabase.from('sources').select('*').eq('project_id', projectId).order('created_at', { ascending: true });
+        const rounds = (roundsRaw || []).slice().sort((a, b) => {
+            const aTime = a?.created_at ? new Date(a.created_at).getTime() : null;
+            const bTime = b?.created_at ? new Date(b.created_at).getTime() : null;
+            if (aTime != null && bTime != null && aTime !== bTime) return aTime - bTime;
+            return String(a?.label ?? '').localeCompare(String(b?.label ?? ''));
+        });
 
-        // Evidence & Extracts (per Source)
-        const sourcesWithData = await Promise.all((sources || []).map(async (s) => {
-            const { data: extracts } = await supabase.from('extracts').select('*').eq('source_id', s.id).order('created_at', { ascending: true });
-            const { data: evidence } = await supabase.from('evidence').select('*').eq('source_id', s.id).order('created_at', { ascending: true });
-            return { ...s, extracts: extracts || [], evidence: evidence || [] };
-        }));
+        const roundIds = rounds.map(r => r.id);
+
+        const { data: queriesRaw, error: qErr } = roundIds.length
+            ? await supabase
+                .from('search_queries')
+                .select('*')
+                .in('round_id', roundIds)
+                .order('executed_at', { ascending: true })
+                .order('created_at', { ascending: true })
+            : { data: [], error: null };
+
+        if (qErr) return res.status(500).json({ error: qErr.message });
+
+        const queriesByRoundId = new Map();
+        (queriesRaw || []).forEach(q => {
+            const key = q.round_id;
+            if (!queriesByRoundId.has(key)) queriesByRoundId.set(key, []);
+            queriesByRoundId.get(key).push(q);
+        });
+
+        // Phase 2: Fetch mapping + sources + extracts + evidence
+        const { data: roundSourcesRaw, error: rsErr } = roundIds.length
+            ? await supabase
+                .from('round_sources')
+                .select('round_id, source_id, created_at')
+                .in('round_id', roundIds)
+                .order('created_at', { ascending: true })
+            : { data: [], error: null };
+
+        if (rsErr) return res.status(500).json({ error: rsErr.message });
+
+        const { data: allSourcesRaw, error: sErr } = await supabase
+            .from('sources')
+            .select('*')
+            .eq('project_id', projectId)
+            .order('created_at', { ascending: true });
+
+        if (sErr) return res.status(500).json({ error: sErr.message });
+
+        const allSources = allSourcesRaw || [];
+        const allSourceIds = allSources.map(s => s.id);
+
+        const { data: extractsRaw, error: exErr } = allSourceIds.length
+            ? await supabase
+                .from('quotes')
+                .select('*')
+                .in('source_id', allSourceIds)
+                .order('created_at', { ascending: true })
+            : { data: [], error: null };
+
+        if (exErr) return res.status(500).json({ error: exErr.message });
+
+        const { data: evidenceRaw, error: evErr } = allSourceIds.length
+            ? await supabase
+                .from('evidence')
+                .select('*')
+                .in('source_id', allSourceIds)
+                .order('created_at', { ascending: true })
+            : { data: [], error: null };
+
+        if (evErr) return res.status(500).json({ error: evErr.message });
+
+        const sourcesById = new Map(allSources.map(s => [s.id, { ...s, extracts: [], evidence: [] }]));
+
+        (extractsRaw || []).forEach(ex => {
+            const s = sourcesById.get(ex.source_id);
+            if (s) s.extracts.push(ex);
+        });
+        (evidenceRaw || []).forEach(ev => {
+            const s = sourcesById.get(ev.source_id);
+            if (s) s.evidence.push(ev);
+        });
+
+        const sourceRoundLabelsBySourceId = new Map();
+        (roundSourcesRaw || []).forEach(link => {
+            const round = rounds.find(r => String(r.id) === String(link.round_id));
+            if (!round) return;
+            const label = String(round.label ?? '');
+            const key = link.source_id;
+            if (!sourceRoundLabelsBySourceId.has(key)) sourceRoundLabelsBySourceId.set(key, []);
+            const arr = sourceRoundLabelsBySourceId.get(key);
+            if (!arr.includes(label)) arr.push(label);
+        });
+
+        const roundSourcesByRoundId = new Map();
+        (roundSourcesRaw || []).forEach(link => {
+            const key = link.round_id;
+            if (!roundSourcesByRoundId.has(key)) roundSourcesByRoundId.set(key, []);
+            roundSourcesByRoundId.get(key).push(link);
+        });
+
+        const unassignedSources = allSources
+            .filter(s => !sourceRoundLabelsBySourceId.has(s.id) || (sourceRoundLabelsBySourceId.get(s.id) || []).length === 0)
+            .map(s => sourcesById.get(s.id))
+            .filter(Boolean);
 
         // 3. Build HTML Template
         const html = `
@@ -540,46 +659,139 @@ app.post('/api/projects/:projectId/export', async (req, res) => {
 
     <main>
         <h2>1. Onderzoeksfasen</h2>
-        ${roundsWithQueries.length === 0 ? '<p>Nog geen fasen vastgelegd.</p>' : roundsWithQueries.map(r => `
+        ${rounds.length === 0 ? '<p>Nog geen fasen vastgelegd.</p>' : rounds.map(r => {
+            const queries = queriesByRoundId.get(r.id) || [];
+            const links = roundSourcesByRoundId.get(r.id) || [];
+            const sourcesForRound = links
+                .slice()
+                .sort((a, b) => {
+                    const aTime = a?.created_at ? new Date(a.created_at).getTime() : null;
+                    const bTime = b?.created_at ? new Date(b.created_at).getTime() : null;
+                    if (aTime != null && bTime != null && aTime !== bTime) return aTime - bTime;
+                    const aSource = sourcesById.get(a.source_id);
+                    const bSource = sourcesById.get(b.source_id);
+                    const aCreated = aSource?.created_at ? new Date(aSource.created_at).getTime() : 0;
+                    const bCreated = bSource?.created_at ? new Date(bSource.created_at).getTime() : 0;
+                    return aCreated - bCreated;
+                })
+                .map(l => sourcesById.get(l.source_id))
+                .filter(Boolean);
+
+            const roundHtml = `
             <div class="round-card">
                 <h3>Fase ${r.label}: ${r.objective}</h3>
                 <p><strong>Zoekopdrachten:</strong></p>
                 <ul>
-                    ${r.queries.length === 0 ? '<li>Geen zoekopdrachten geregistreerd voor deze fase.</li>' : r.queries.map(q => `
-                        <li><code>[${q.executed_at}]</code> ${q.query_text}</li>
+                    ${queries.length === 0 ? '<li>Geen zoekopdrachten geregistreerd voor deze fase.</li>' : queries.map(q => `
+                        <li><code>[${q.executed_at}]</code> ${q.query_text}${q.notes ? ` <span style="opacity:0.7">(${q.notes})</span>` : ''}</li>
                     `).join('')}
                 </ul>
-            </div>
-        `).join('')}
 
-        <h2>2. Bronnen & Bewijsvoering</h2>
-        ${sourcesWithData.length === 0 ? '<p>Nog geen bronnen verworven.</p>' : sourcesWithData.map(s => `
-            <div class="source-card">
-                <p><strong>BRON:</strong> ${s.title || 'Naamloze bron'}</p>
-                <p style="font-size: 0.8rem;"><code>${s.url}</code></p>
-                <p><strong>Type:</strong> ${s.source_type} | <strong>Auteur:</strong> ${s.author || 'Onbekend'} | <strong>Uitgever:</strong> ${s.publisher || 'Onbekend'}</p>
-                
-                ${s.evidence.length > 0 ? `
-                    <p><strong>Bewijsvoering in Dossier:</strong></p>
-                    ${s.evidence.map(ev => `
-                        <div class="evidence-item">
-                            <p><strong>${ev.evidence_type.toUpperCase()} @ ${ev.location_ref}:</strong> "${ev.evidence_text}"</p>
-                            <p style="font-size: 0.85rem; color: #1e40af;"><strong>Relevantie:</strong> ${ev.why_relevant}</p>
-                            <p style="font-size: 0.75rem; opacity: 0.6;">Context: ${ev.context_text}</p>
+                <p><strong>Bronnen:</strong></p>
+                ${sourcesForRound.length === 0 ? '<p style="opacity:0.7; font-size:0.9rem;">No sources recorded for this round.</p>' : sourcesForRound.map(s => {
+                    const linkedRounds = sourceRoundLabelsBySourceId.get(s.id) || [];
+                    const badge = linkedRounds.length > 1
+                        ? `<p style="font-size:0.8rem; opacity:0.75;"><strong>Linked rounds:</strong> ${linkedRounds.join(', ')}</p>`
+                        : '';
+
+                    const extractsHtml = (s.extracts || []).length
+                        ? `
+                            <details style="margin-top: 1rem; font-size: 0.85rem;">
+                                <summary>Extracts (${s.extracts.length})</summary>
+                                ${(s.extracts || []).map(ex => {
+                                    const loc = ex.location_ref ? ex.location_ref : 'Unknown';
+                                    return `
+                                        <div class="extract-item">"${ex.extract_text}"</div>
+                                        <div class="extract-item" style="opacity:0.8;">Context: ${ex.context_text}</div>
+                                        <div class="extract-item" style="opacity:0.8;">Location: ${loc}</div>
+                                    `;
+                                }).join('')}
+                            </details>
+                        `
+                        : '';
+
+                    const evidenceHtml = (s.evidence || []).length
+                        ? `
+                            <p><strong>Bewijsvoering in Dossier:</strong></p>
+                            ${(s.evidence || []).map(ev => {
+                                const loc = ev.location_ref ? ev.location_ref : 'Unknown';
+                                return `
+                                    <div class="evidence-item">
+                                        <p><strong>${String(ev.evidence_type || '').toUpperCase()} @ ${loc}:</strong> "${ev.evidence_text}"</p>
+                                        <p style="font-size: 0.85rem; color: #1e40af;"><strong>Relevantie:</strong> ${ev.why_relevant}</p>
+                                        <p style="font-size: 0.75rem; opacity: 0.6;">Context: ${ev.context_text}</p>
+                                    </div>
+                                `;
+                            }).join('')}
+                        `
+                        : '<p style="opacity: 0.5; font-size: 0.85rem;">Geen formele bewijsvoering geselecteerd voor deze bron.</p>';
+
+                    return `
+                        <div class="source-card">
+                            <p><strong>BRON:</strong> ${s.title || 'Naamloze bron'}</p>
+                            <p style="font-size: 0.8rem; word-break: break-word;"><code>${s.url}</code></p>
+                            <p><strong>Type:</strong> ${s.source_type} | <strong>Auteur:</strong> ${s.author || 'Onbekend'} | <strong>Uitgever:</strong> ${s.publisher || 'Onbekend'}</p>
+                            ${badge}
+                            ${s.summary ? `<p style="margin-top:0.5rem;"><strong>Summary:</strong> ${s.summary}</p>` : ''}
+                            ${s.notes ? `<p style="margin-top:0.25rem;"><strong>Notes:</strong> ${s.notes}</p>` : ''}
+                            ${evidenceHtml}
+                            ${extractsHtml}
                         </div>
-                    `).join('')}
-                ` : '<p style="opacity: 0.5; font-size: 0.8rem;">Geen formele bewijsvoering geselecteerd voor deze bron.</p>'}
-
-                ${s.extracts.length > 0 ? `
-                    <details style="margin-top: 1rem; font-size: 0.8rem;">
-                        <summary>Extra Extracts (${s.extracts.length})</summary>
-                        ${s.extracts.map(ex => `
-                            <div class="extract-item">"${ex.extract_text}" (${ex.location_ref})</div>
-                        `).join('')}
-                    </details>
-                ` : ''}
+                    `;
+                }).join('')}
             </div>
-        `).join('')}
+            `;
+
+            return roundHtml;
+        }).join('')}
+
+        <h2>2. ⚠ Unassigned sources (data integrity issue)</h2>
+        <p style="opacity:0.8;">Count: ${unassignedSources.length}</p>
+        ${unassignedSources.length === 0 ? '<p style="opacity:0.7;">Geen unassigned bronnen gevonden.</p>' : unassignedSources.map(s => {
+            const extractsHtml = (s.extracts || []).length
+                ? `
+                    <details style="margin-top: 1rem; font-size: 0.85rem;">
+                        <summary>Extracts (${s.extracts.length})</summary>
+                        ${(s.extracts || []).map(ex => {
+                            const loc = ex.location_ref ? ex.location_ref : 'Unknown';
+                            return `
+                                <div class="extract-item">"${ex.extract_text}"</div>
+                                <div class="extract-item" style="opacity:0.8;">Context: ${ex.context_text}</div>
+                                <div class="extract-item" style="opacity:0.8;">Location: ${loc}</div>
+                            `;
+                        }).join('')}
+                    </details>
+                `
+                : '';
+
+            const evidenceHtml = (s.evidence || []).length
+                ? `
+                    <p><strong>Bewijsvoering in Dossier:</strong></p>
+                    ${(s.evidence || []).map(ev => {
+                        const loc = ev.location_ref ? ev.location_ref : 'Unknown';
+                        return `
+                            <div class="evidence-item">
+                                <p><strong>${String(ev.evidence_type || '').toUpperCase()} @ ${loc}:</strong> "${ev.evidence_text}"</p>
+                                <p style="font-size: 0.85rem; color: #1e40af;"><strong>Relevantie:</strong> ${ev.why_relevant}</p>
+                                <p style="font-size: 0.75rem; opacity: 0.6;">Context: ${ev.context_text}</p>
+                            </div>
+                        `;
+                    }).join('')}
+                `
+                : '<p style="opacity: 0.5; font-size: 0.85rem;">Geen formele bewijsvoering geselecteerd voor deze bron.</p>';
+
+            return `
+                <div class="source-card" style="border-left-color:#ef4444;">
+                    <p><strong>BRON:</strong> ${s.title || 'Naamloze bron'}</p>
+                    <p style="font-size: 0.8rem; word-break: break-word;"><code>${s.url}</code></p>
+                    <p><strong>Type:</strong> ${s.source_type} | <strong>Auteur:</strong> ${s.author || 'Onbekend'} | <strong>Uitgever:</strong> ${s.publisher || 'Onbekend'}</p>
+                    ${s.summary ? `<p style="margin-top:0.5rem;"><strong>Summary:</strong> ${s.summary}</p>` : ''}
+                    ${s.notes ? `<p style="margin-top:0.25rem;"><strong>Notes:</strong> ${s.notes}</p>` : ''}
+                    ${evidenceHtml}
+                    ${extractsHtml}
+                </div>
+            `;
+        }).join('')}
     </main>
 
     <div class="footer">
@@ -606,7 +818,7 @@ app.post('/api/projects/:projectId/export', async (req, res) => {
         // 5. Stream back
         const fileName = `${project.title.replace(/[^a-z0-9]/gi, '_')}_export.pdf`;
         res.set({
-            'Content-Type': 'application/json', // Will return binary, but standard says base64 or blob handling
+            'Content-Type': 'application/pdf',
             'Content-Disposition': `attachment; filename="${fileName}"`
         });
 

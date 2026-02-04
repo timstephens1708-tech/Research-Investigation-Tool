@@ -200,19 +200,29 @@ function App() {
       return setErrorMsg('Alle velden (Bewijs, Context, Locatie, Relevantie) zijn verplicht.');
     }
 
-    const res = await fetch(`${API_BASE}/sources/${activeSourceId}/evidence`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(evidenceForm)
-    });
+    try {
+      const res = await fetch(`${API_BASE}/sources/${activeSourceId}/evidence`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(evidenceForm)
+      });
 
-    if (res.ok) {
-      setSuccessMsg('Bewijsstuk vastgelegd.');
-      setEvidenceForm({ evidence_type: 'quote', evidence_text: '', context_text: '', location_ref: '', why_relevant: '', extract_id: '' });
-      fetchEvidence(activeSourceId);
-    } else {
-      const err = await res.json();
-      setErrorMsg(err.error);
+      if (res.ok) {
+        setSuccessMsg('Bewijsstuk vastgelegd.');
+        setEvidenceForm({ evidence_type: 'quote', evidence_text: '', context_text: '', location_ref: '', why_relevant: '', extract_id: '' });
+        fetchEvidence(activeSourceId);
+      } else {
+        const text = await res.text();
+        try {
+          const err = JSON.parse(text);
+          setErrorMsg(err.error || err.message || 'Server fout bij opslaan.');
+        } catch (e) {
+          setErrorMsg(`Server Fout (${res.status}): ${text.substring(0, 50)}...`);
+        }
+      }
+    } catch (err) {
+      console.error(err);
+      setErrorMsg('Netwerkfout: Kan geen verbinding maken met de server.');
     }
   };
 
@@ -231,8 +241,14 @@ function App() {
       why_relevant: '',
       extract_id: ex.id
     });
-    // Scroll to form or focus
-    window.scrollTo({ top: 0, behavior: 'smooth' });
+    // Scroll to form and focus the 'why relevant' field
+    setTimeout(() => {
+      const el = document.getElementById('why_relevant_input');
+      if (el) {
+        el.focus();
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+    }, 100);
   };
 
   const handleDeleteExtract = async (extractId) => {
@@ -429,8 +445,11 @@ function App() {
                         <textarea required rows="3" value={evidenceForm.evidence_text} onChange={e => setEvidenceForm({ ...evidenceForm, evidence_text: e.target.value })} placeholder="Geselecteerde tekst of observatie..." />
                       </div>
                       <div className="form-group">
-                        <label style={{ color: 'var(--accent-primary)', fontWeight: 700 }}>WAAROM is dit relevant? (Geen conclusie) *</label>
-                        <textarea required rows="3" value={evidenceForm.why_relevant} onChange={e => setEvidenceForm({ ...evidenceForm, why_relevant: e.target.value })} placeholder="Leg uit hoe dit de onderzoeksvraag beantwoordt..." />
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                          <label style={{ color: 'var(--accent-primary)', fontWeight: 700 }}>WAAROM is dit relevant? (Geen conclusie) *</label>
+                          {evidenceForm.extract_id && <span style={{ fontSize: '0.7rem', color: 'var(--success)', fontWeight: 'bold' }}>✓ Overgenomen uit extract</span>}
+                        </div>
+                        <textarea id="why_relevant_input" required rows="3" value={evidenceForm.why_relevant} onChange={e => setEvidenceForm({ ...evidenceForm, why_relevant: e.target.value })} placeholder="Leg uit hoe dit de onderzoeksvraag beantwoordt..." />
                         <span style={{ fontSize: '0.7rem', opacity: 0.5 }}>Vermijd woorden als "dus", "bewijst" of "conclusie".</span>
                       </div>
                       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
@@ -500,8 +519,18 @@ function App() {
 
                       <div style={{ background: 'rgba(0,0,0,0.1)', padding: '1rem', borderRadius: '8px', marginTop: '1.5rem' }}>
                         <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '1rem' }}>
-                          <input style={{ flex: 1 }} placeholder="Nieuwe zoekterm..." value={queryForm.roundId === r.id ? queryForm.text : ''} onChange={e => setQueryForm({ ...queryForm, roundId: r.id, text: e.target.value })} />
-                          <input type="date" value={queryForm.roundId === r.id ? queryForm.date : ''} onChange={e => setQueryForm({ ...queryForm, roundId: r.id, date: e.target.value })} />
+                          <input
+                            style={{ flex: 1 }}
+                            placeholder="Nieuwe zoekterm..."
+                            value={String(queryForm.roundId) == String(r.id) ? queryForm.text : ''}
+                            onChange={e => setQueryForm({ ...queryForm, roundId: r.id, text: e.target.value })}
+                          />
+                          <input
+                            type="date"
+                            style={{ width: 'auto' }}
+                            value={String(queryForm.roundId) == String(r.id) ? queryForm.date : ''}
+                            onChange={e => setQueryForm({ ...queryForm, roundId: r.id, date: e.target.value })}
+                          />
                           <button className="btn btn-primary" onClick={() => handleLogQuery(r.id)}>Vastleggen</button>
                         </div>
                         {(queries[r.id] || []).map(q => (
